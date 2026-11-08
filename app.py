@@ -34,7 +34,6 @@ Tls = 'tls'
 ISP = ''
 
 # dns server
-DNS_SERVERS = ['8.8.4.4', '1.1.1.1']
 BLOCKED_DOMAINS = [
     'speedtest.net', 'fast.com', 'speedtest.cn', 'speed.cloudflare.com', 'speedof.me',
     'testmy.net', 'bandwidth.place', 'speed.io', 'librespeed.org', 'speedcheck.org'
@@ -130,24 +129,36 @@ async def resolve_host(host: str) -> str:
     try:
         ipaddress.ip_address(host)
         return host
-    except:
+    except ValueError:
         pass
-    
-    for dns_server in DNS_SERVERS:
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f'https://dns.google/resolve?name={host}&type=A'
-                async with session.get(url, timeout=5) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get('Status') == 0 and data.get('Answer'):
-                            for answer in data['Answer']:
-                                if answer.get('type') == 1:
-                                    return answer.get('data')
-        except:
-            continue
-    
-    return host  # 如果解析失败，返回原始域名
+
+    try:
+        addresses = await asyncio.wait_for(
+            asyncio.get_running_loop().getaddrinfo(
+                host, None, family=socket.AF_INET, type=socket.SOCK_STREAM
+            ),
+            timeout=3,
+        )
+        return addresses[0][4][0]
+    except (OSError, asyncio.TimeoutError):
+        pass
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                'https://dns.google/resolve',
+                params={'name': host, 'type': 'A'},
+                timeout=aiohttp.ClientTimeout(total=2),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for answer in data.get('Answer', []):
+                        if answer.get('type') == 1:
+                            return answer['data']
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        pass
+
+    raise OSError('Unable to resolve target hostname')
 
 class ProxyHandler:
     def __init__(self, uuid: str):
@@ -207,7 +218,9 @@ class ProxyHandler:
             resolved_host = await resolve_host(host)
             
             try:
-                reader, writer = await asyncio.open_connection(resolved_host, port)
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(resolved_host, port), timeout=8
+                )
                 
                 # 发送剩余数据
                 if i < len(first_msg):
@@ -237,10 +250,18 @@ class ProxyHandler:
                     except:
                         pass
                 
-                await asyncio.gather(
-                    forward_ws_to_tcp(),
-                    forward_tcp_to_ws()
-                )
+                tasks = [
+                    asyncio.create_task(forward_ws_to_tcp()),
+                    asyncio.create_task(forward_tcp_to_ws()),
+                ]
+                try:
+                    await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    writer.close()
+                    await websocket.close()
                 
             except Exception as e:
                 if DEBUG:
